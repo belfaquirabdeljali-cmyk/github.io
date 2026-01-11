@@ -1,0 +1,227 @@
+export default {
+  async fetch(req, env) {
+    const rid = crypto.randomUUID();
+    const log = (m, x) => console.log(`[${rid}] ${m}`, x ?? "");
+
+    // CORS
+    if (req.method === "OPTIONS") {
+      return new Response("", { status: 204, headers: corsHeaders(req) });
+    }
+    if (req.method !== "POST") {
+      return new Response("Only POST allowed", { status: 405, headers: corsHeaders(req) });
+    }
+
+    try {
+      const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+      log("Incoming POST", { ip, hasKV: !!env.RL_KV }); // ✅ زدت hasKV
+
+      // ✅ Anti-spam (rate limit) (نفس اللي كان)
+      const rl = await rateLimit(ip, env.RL_KV, {
+        maxPerWindow: 1,     // 3 reports
+        windowSec: 120,      // per 10 minutes
+        cooldownSec: 120      // 1 report every 15s minimum
+      });
+
+      if (!rl.ok) {
+        log("Rate limited", rl);
+        return new Response(
+          `Rate limit. Try again in ${rl.retryAfterSec}s`,
+          {
+            status: 429,
+            headers: {
+              ...corsHeaders(req),
+              "Retry-After": String(rl.retryAfterSec),
+            },
+          }
+        );
+      }
+
+      const form = await req.formData();
+
+      // Honeypot
+      const hp = (form.get("website") || "").toString().trim();
+      if (hp) {
+        log("Blocked by honeypot");
+        return new Response("Blocked", { status: 403, headers: corsHeaders(req) });
+      }
+
+      // Turnstile
+      const token = (form.get("cf-turnstile-response") || "").toString().trim();
+      if (!token) {
+        log("Captcha required");
+        return new Response("Captcha required", { status: 400, headers: corsHeaders(req) });
+      }
+
+      const v = await verifyTurnstile(token, req, env, rid);
+      if (!v.ok) {
+        log("Captcha failed", v);
+        return new Response("Captcha failed", { status: 403, headers: corsHeaders(req) });
+      }
+
+      // Fields
+      const user = (form.get("user") || "").toString().trim();
+      const type = (form.get("type") || "").toString().trim();
+
+      // ✅ IMPORTANT: form field is reported_player in your site
+      const reportedPlayer =
+        (form.get("reported_player") || form.get("reportedPlayer") || "").toString().trim();
+
+      const reason = (form.get("reason") || "").toString().trim();
+      const file = form.get("screenshot");
+
+      if (!user || !type || !reason) {
+        log("Missing data");
+        return new Response("Missing data", { status: 400, headers: corsHeaders(req) });
+      }
+
+      if (!["Player", "Bug"].includes(type)) {
+        log("Invalid type", type);
+        return new Response("Invalid type", { status: 400, headers: corsHeaders(req) });
+      }
+
+      // ✅ Bot config (بدل webhook)
+      const BOT_TOKEN = env.DISCORD_BOT_TOKEN;
+      const CHANNEL_ID = env.DISCORD_CHANNEL_ID;
+
+      if (!BOT_TOKEN || !CHANNEL_ID) {
+        log("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID missing");
+        return new Response("Server not configured", { status: 500, headers: corsHeaders(req) });
+      }
+
+      // Optional file validation
+      const hasFile = file instanceof File && file.size > 0;
+      if (hasFile) {
+        const MAX = 5 * 1024 * 1024;
+        if (file.size > MAX) {
+          return new Response("File too large (max 5MB)", { status: 400, headers: corsHeaders(req) });
+        }
+        const ct = (file.type || "").toLowerCase();
+        if (!ct.startsWith("image/")) {
+          return new Response("Only image files allowed", { status: 400, headers: corsHeaders(req) });
+        }
+      }
+
+      // Discord message (نفس structure)
+      let content =
+`🛑 **New Minecraft Report**
+👤 Reporter: **${escapeMd(user)}**
+📂 Type: **${escapeMd(type)}**`;
+
+      if (type === "Player" && reportedPlayer) {
+        content += `\n🎯 Reported Player: **${escapeMd(reportedPlayer)}**`;
+      }
+
+      content += `\n\n<@&1459230502325190802>\n\n📝 Reason:\n${escapeMd(reason)}`;
+
+      // ✅ Send to Discord via BOT API
+      const url = `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`;
+
+      let r;
+      if (hasFile) {
+        const fd = new FormData();
+        fd.append("payload_json", JSON.stringify({ content }));
+        fd.append("files[0]", file, file.name || "screenshot.png"); // ✅ files[0]
+
+        r = await fetch(url, {
+          method: "POST",
+          headers: { "Authorization": `Bot ${BOT_TOKEN}` },
+          body: fd,
+        });
+      } else {
+        r = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bot ${BOT_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ content }),
+        });
+      }
+
+      if (!r.ok) {
+        const txt = await r.text().catch(() => "");
+        log("Discord error", { status: r.status, body: txt.slice(0, 300) });
+        return new Response("Discord error: " + txt.slice(0, 200), { status: 502, headers: corsHeaders(req) });
+      }
+
+      log("OK");
+      return new Response("OK", { status: 200, headers: corsHeaders(req) });
+
+    } catch (e) {
+      console.log("Worker crash:", e);
+      return new Response("Error", { status: 500, headers: corsHeaders(req) });
+    }
+  },
+};
+
+// ---------- Rate limit using KV (نفس اللي كان) ----------
+async function rateLimit(ip, kv, cfg) {
+  if (!kv || ip === "unknown") {
+    return { ok: true, bypass: true, why: !kv ? "no-kv" : "unknown-ip" };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const { maxPerWindow, windowSec, cooldownSec } = cfg;
+
+  // cooldown key (prevents rapid spam)
+  const coolKey = `cool:${ip}`;
+  const last = await kv.get(coolKey);
+  if (last) {
+    const retryAfter = Math.max(1, cooldownSec - (now - Number(last)));
+    return { ok: false, reason: "cooldown", retryAfterSec: retryAfter };
+  }
+
+  // window counter key
+  const windowId = Math.floor(now / windowSec);
+  const countKey = `rl:${ip}:${windowId}`;
+
+  const cur = Number((await kv.get(countKey)) || "0");
+  if (cur >= maxPerWindow) {
+    const windowEnd = (windowId + 1) * windowSec;
+    return { ok: false, reason: "window", retryAfterSec: Math.max(1, windowEnd - now) };
+  }
+
+  await kv.put(countKey, String(cur + 1), { expirationTtl: windowSec + 60 });
+  await kv.put(coolKey, String(now), { expirationTtl: cooldownSec });
+
+  return { ok: true };
+}
+
+// ---------- helpers ----------
+function corsHeaders(req) {
+  const origin = req.headers.get("Origin") || "*";
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+async function verifyTurnstile(token, req, env, rid) {
+  const secret = env.TURNSTILE_SECRET;
+  if (!secret) return { ok: false, reason: "missing-secret" };
+
+  const ip = req.headers.get("CF-Connecting-IP") || "";
+  const body = new URLSearchParams();
+  body.set("secret", secret);
+  body.set("response", token);
+  if (ip) body.set("remoteip", ip);
+
+  const resp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  const data = await resp.json().catch(() => null);
+  if (!data || !data.success) {
+    console.log(`[${rid}] Turnstile failed`, data?.["error-codes"] || data);
+    return { ok: false, reason: "verify-failed", codes: data?.["error-codes"] || [] };
+  }
+  return { ok: true };
+}
+
+function escapeMd(s) {
+  return String(s).replace(/([\\`*_{}[\]()#+\-.!|>])/g, "\\$1");
+}
